@@ -84,7 +84,7 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\DapperExtension.csproj">
+    <ProjectReference Include="..\DapperExtension\DapperExtension.csproj">
       <Project>{331474c2-539e-4b32-bd04-8613ecae58d2}</Project>
       <Name>DapperExtension</Name>
     </ProjectReference>
