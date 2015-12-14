@@ -7,6 +7,8 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Text;
+using System.Data.Common;
 
 namespace DapperExtension
 {
@@ -15,9 +17,16 @@ namespace DapperExtension
     /// </summary>
     public static class SqlExtension
     {
+        static readonly ISqlAdapter adapter = new MySqlAdapter();
+
         static readonly ConcurrentDictionary<RuntimeTypeHandle, string> TypeTableName = new ConcurrentDictionary<RuntimeTypeHandle, string>();
 
-        static ConcurrentDictionary<Type, List<string>> paramNameCache = new ConcurrentDictionary<Type, List<string>>();
+        static ConcurrentDictionary<Type, PropertyInfo[]> paramNameCache = new ConcurrentDictionary<Type, PropertyInfo[]>();
+
+        static SqlExtension()
+        {
+            adapter = new MySqlAdapter();
+        }
 
         /// <summary>
         /// implementation from Dapper.Contrib
@@ -52,56 +61,123 @@ namespace DapperExtension
 
         /// <summary>
         /// implementation from Dapper.Rainbow
-        /// REVIEW: ymt 結局インテリセンス効かないし無駄にキャッシュするしなので、ラムダ式にして最低限だけqueryableにする
         /// </summary>
         static List<string> GetParamNames(object o)
         {
-            var parameters = o as DynamicParameters;
-            if (parameters != null)
+            // 使うならコメントアウト外す
+            //var parameters = o as DynamicParameters;
+            //if (parameters != null)
+            //{
+            //    return parameters.ParameterNames.ToList();
+            //}
+
+            // キャッシュからクラス情報の取得を試みる
+            PropertyInfo[] propertyInfo;
+            if (!paramNameCache.TryGetValue(o.GetType(), out propertyInfo))
             {
-                return parameters.ParameterNames.ToList();
+                propertyInfo = o.GetType().GetProperties(BindingFlags.GetProperty | BindingFlags.Instance | BindingFlags.Public);
+                paramNameCache[o.GetType()] = propertyInfo;
             }
 
-            List<string> paramNames;
-            if (!paramNameCache.TryGetValue(o.GetType(), out paramNames))
+            List<string> paramNames = new List<string>();
+            foreach (var prop in propertyInfo)
             {
-                paramNames = new List<string>();
-                foreach (var prop in o.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public).Where(p => p.GetGetMethod(false) != null))
-                {
-                    var attribs = prop.GetCustomAttributes(typeof(IgnorePropertyAttribute), true);
-                    var attr = attribs.FirstOrDefault() as IgnorePropertyAttribute;
-                    if (attr == null || (!attr.Value))
-                    {
-                        paramNames.Add(prop.Name);
-                    }
-                }
-                paramNameCache[o.GetType()] = paramNames;
+                // 使うならコメントアウト外す
+                //var attribs = prop.GetCustomAttributes(typeof(IgnorePropertyAttribute), true);
+                //var attr = attribs.FirstOrDefault() as IgnorePropertyAttribute;
+                //if (attr == null || (!attr.Value))
+                //{
+                //    paramNames.Add(prop.Name);
+                //}
+                paramNames.Add(prop.Name);
             }
             return paramNames;
         }
 
-        //public static T Select<T>(this IDbConnection connection, dynamic id) where T : class
-        //{
-        //    return connection.Query<T>("SELECT * FROM `" + GetTableName(typeof(T)) + "` WHERE id = @id", new { id }).FirstOrDefault();
-        //}
 
-        // TODO: 2015/12/11 簡単なwhere条件だけの複数レコード取得。フィールドを限定してレコード取得。
+        // TODO: 2015/12/11 フィールドを限定してレコード取得。transaction。commandTimeout。
+
 
         /// <summary>
         /// Grab a record with where clause from the DB 
         /// </summary>
-        /// <param name="where"></param>
-        public static T Select<T>(this IDbConnection connection, object where)
+        public static T Select<T>(this IDbConnection connection, T where)
         {
             return (All<T>(connection, where)).FirstOrDefault();
         }
 
         /// <summary>
+        /// Grab records with where clause from the DB 
+        /// </summary>
+        public static IEnumerable<T> SelectAll<T>(this IDbConnection connection, T where)
+        {
+            return All<T>(connection, where);
+        }
+
+        /// <summary>
+        /// 指定したentityでUpdateをかける。
+        /// TODO SETとWHEREでカラムがかぶる場合どうする？Dapper.Contrib参照
+        /// </summary>
+        public static bool Update<T>(this IDbConnection connection, T entity, T where) where T : class
+        {
+            var tableName = GetTableName(typeof(T));
+
+            // SETするパラメータのSQLをビルド
+            var setParams = GetParamNames(entity);
+            var setSql = string.Join(", ", setParams.Select(p => "`" + p + "` = @" + p));
+
+            // WHERE句のSQLをビルド
+            var whereParams = GetParamNames(where);
+            var whereSql = string.Join(" AND ", setParams.Select(p => "`" + p + "` = @" + p));
+
+            var sql = $"UPDATE {tableName} SET {setSql} WHERE {whereSql}";
+            return connection.Execute(sql, where) > 0;
+        }
+
+
+        /// <summary>
+        /// Dapper.Contrib
+        /// https://github.com/StackExchange/dapper-dot-net/blob/master/Dapper.Contrib/SqlMapperExtensions.cs#L292
+        /// </summary>
+        public static long Insert<T>(this IDbConnection connection, T entityToInsert, IDbTransaction transaction = null, int? commandTimeout = null) where T : class
+        {
+            var tableName = GetTableName(typeof(T));
+            var isList = false;
+            var type = typeof(T);
+
+            if (type.IsArray || type.IsGenericType)
+            {
+                isList = true;
+            }
+
+            var paramNames = GetParamNames(entityToInsert);
+            // カラム部分のSQL
+            var columnSql = string.Join(", ", paramNames.Select(p => p));
+            // VALUES部分のSQL
+            var valuesSql = string.Join(", ", paramNames.Select(p => "@" + p));
+
+            int returnVal;
+
+            if (!isList)
+            {
+                //single entity (get last inserted id)
+                returnVal = adapter.Insert(connection, transaction, commandTimeout, tableName,
+                    columnSql, valuesSql, entityToInsert);
+            }
+            else
+            {
+                //insert list of entities
+                var cmd = $"INSERT INTO {tableName} ({columnSql}) VALUES ({valuesSql})";
+                returnVal = connection.Execute(cmd, entityToInsert, transaction, commandTimeout);
+            }
+
+            return returnVal;
+        }
+
+        /// <summary>
         /// Return All record
         /// </summary>
-        /// <param name="where"></param>
-        /// <returns></returns>
-        public static IEnumerable<T> All<T>(this IDbConnection connection, object where = null)
+        static IEnumerable<T> All<T>(this IDbConnection connection, object where = null)
         {
             var sql = "SELECT * FROM " + GetTableName(typeof(T));
             if (where == null) return connection.Query<T>(sql);
@@ -110,4 +186,30 @@ namespace DapperExtension
             return connection.Query<T>(sql + " WHERE " + w, where);
         }
     }
+}
+
+/// <summary>
+/// TODO: コピペしてちょっとけしただけ
+/// https://github.com/StackExchange/dapper-dot-net/blob/master/Dapper.Contrib/SqlMapperExtensions.cs#L745
+/// </summary>
+public partial class MySqlAdapter : ISqlAdapter
+{
+    public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, string tableName,
+        string columnSql, string valuesSql, object entityToInsert)
+    {
+        var cmd = $"INSERT INTO {tableName} ({columnSql}) VALUES ({valuesSql})";
+        connection.Execute(cmd, entityToInsert, transaction, commandTimeout);
+
+        // REVIEW
+        var r = connection.Query("SELECT LAST_INSERT_ID() id", transaction: transaction, commandTimeout: commandTimeout);
+        var id = r.First().id;
+        if (id == null) return 0;
+
+        return Convert.ToInt32(id);
+    }
+}
+
+public partial interface ISqlAdapter
+{
+    int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, string tableName, string columnSql, string valuesSql, object entityToInsert);
 }

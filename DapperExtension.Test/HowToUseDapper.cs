@@ -33,7 +33,10 @@ namespace DapperExtension.Tests
                 //   クエリの発行は、Query<T>メソッドで行います。
                 //
                 //var mappingObj = connection.Query<Employee>("SELECT * FROM employees LIMIT 1").FirstOrDefault();
-                var mappingObj = connection.Select<Employee>(10001);
+                var mappingObj = connection.Select<Employee>(new Employee
+                {
+                    EmpNo = 10001
+                });
 
                 Assert.AreEqual(10001, mappingObj.EmpNo);
                 Assert.AreEqual(Employee.EGender.M, mappingObj.Gender);
